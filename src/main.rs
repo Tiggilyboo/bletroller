@@ -8,14 +8,16 @@
 use bl602_hal as hal;
 
 use core::fmt::Write;
-use embedded_hal::delay::blocking::DelayMs;
-use embedded_hal::digital::blocking::OutputPin;
+use embedded_hal::digital::blocking::{OutputPin, ToggleableOutputPin};
+use embedded_hal::{delay::blocking::DelayMs, adc::nb::Channel};
+use embedded_hal::adc::nb::OneShot;
 
 use hal::{
 	clock::{Strict, SysclkFreq, UART_PLL_FREQ},
 	pac,
 	prelude::*,
 	serial::*,
+    adc::*,
 };
 
 // We want our embedded system to halt indefinitely when we panic.
@@ -29,64 +31,75 @@ const BAUD_RATE:u32 = 1000000;
 #[riscv_rt::entry]
 fn main() -> ! {
 
-	// Load all peripherals
-	let dp = pac::Peripherals::take().unwrap();
-	// split the register block into individual pins and modules
-	let mut parts = dp.GLB.split();
+    // Load all peripherals
+    let dp = pac::Peripherals::take().unwrap();
+    // split the register block into individual pins and modules
+    let mut parts = dp.GLB.split();
 
-	// Set up all the clocks we need
-	let clocks = Strict::new()
-		.use_pll(40_000_000u32.Hz())
-		.sys_clk(SysclkFreq::Pll160Mhz)
-		.uart_clk(UART_PLL_FREQ.Hz())
-		.freeze(&mut parts.clk_cfg);
+    // Set up uart output. Bl602 uses a pin matrix so we set muxes too.
+    let pin16 = parts.pin16.into_uart_sig0();
+    let pin7 = parts.pin7.into_uart_sig7();
+    let mux0 = parts.uart_mux0.into_uart0_tx();
+    let mux7 = parts.uart_mux7.into_uart0_rx();
+    
+    let mut red_led = parts.pin17.into_pull_down_output();
+    let mut blue_led = parts.pin11.into_pull_down_output();
+    let mut green_led = parts.pin14.into_pull_down_output();
+    let mut adc_pin = parts.pin10.into_adc();
+    
+    red_led.set_high().unwrap();
+    blue_led.set_low().unwrap();
+    green_led.set_low().unwrap();
+    
+    let clocks = Strict::new()
+        .use_pll(40_000_000u32.Hz())
+        .sys_clk(SysclkFreq::Pll160Mhz)
+        .uart_clk(UART_PLL_FREQ.Hz())
+        .adc_clk(1000u32.Hz())
+        .freeze(&mut parts.clk_cfg);
+	
+    let mut delay = hal::delay::McycleDelay::new(clocks.sysclk().0);
 
-	// Set up uart output. Bl602 uses a pin matrix so we set muxes too.
-	let pin16 = parts.pin16.into_uart_sig0();
-	let pin7 = parts.pin7.into_uart_sig7();
-	let mux0 = parts.uart_mux0.into_uart0_tx();
-	let mux7 = parts.uart_mux7.into_uart0_rx();
+    red_led.set_low().unwrap();
+    green_led.set_high().unwrap();
 
-	// Configure our UART to our baudrate, and use the pins we configured above
-	let mut serial = Serial::new(dp.UART0, Config::default().baudrate(BAUD_RATE.Bd()), ((pin16, mux0), (pin7, mux7)), clocks);
+    // Configure our UART to our baudrate, and use the pins we configured above
+    let mut serial = Serial::new(dp.UART0, Config::default().baudrate(BAUD_RATE.Bd()), ((pin16, mux0), (pin7, mux7)), clocks);
+    
+    serial.write_str("Serial initialized\n").ok();
+    
+    green_led.set_low().unwrap();
+    blue_led.set_high().unwrap();
 
-	// Pins for LED for Pinecone dev board
-	let mut blue_led = parts.pin11.into_pull_down_output();
-	let mut green_led = parts.pin14.into_pull_down_output();
-	let mut red_led = parts.pin17.into_pull_down_output();
+    green_led.set_high().unwrap();
+    blue_led.set_low().unwrap();
 
-	// Create a delay function using the riscv chip cycle counter
-	let mut delay = bl602_hal::delay::McycleDelay::new(clocks.sysclk().0);
+    // Pins for ADC for Pinecone dev board
+    let adc_channel = adc_pin.channel();
+    let mut adc = Adc1::new(adc_channel);
+    serial.write_str("Created adc config\n").ok();
+    adc.init(&clocks);
+    
+    green_led.set_low().unwrap();
+    blue_led.set_low().unwrap();
 
-	loop {
-		// Toggle the LED on and off once a second. Report LED status over UART
+    serial.write_fmt(format_args!("Initialized adc {adc_channel:?}\n")).ok();
 
-		// Set blue led to high (turn on)
-		blue_led.set_high().unwrap();
-		// write to serial connection
-		serial.write_str("RED HIGH\r\n").ok();
-		// wait for 1000ms (not entire accurate, since it uses the internal cycle counter)
-		delay.delay_ms(1000).unwrap();
+    red_led.set_low().unwrap();
 
-		// set blue led to low (turn off)
-		blue_led.set_low().unwrap();
-		serial.write_str("BLUE  LOW\r\n").ok();
-		delay.delay_ms(1000).unwrap();
+    loop {
+        delay.delay_ms(1000).unwrap();
+        green_led.toggle().unwrap();
 
-		green_led.set_high().unwrap();
-		serial.write_str("GREEN HIGH\r\n").ok();
-		delay.delay_ms(1000).unwrap();
-
-		green_led.set_low().unwrap();
-		serial.write_str("GREEN  LOW\r\n").ok();
-		delay.delay_ms(1000).unwrap();
-
-		red_led.set_high().unwrap();
-		serial.write_str("RED HIGH\r\n").ok();
-		delay.delay_ms(1000).unwrap();
-
-		red_led.set_low().unwrap();
-		serial.write_str("RED  LOW\r\n").ok();
-		delay.delay_ms(1000).unwrap();
-	}
+        let adc_value: Result<u16, _> = adc.read(&mut adc_pin);
+        match adc_value {
+            Ok(adc_value) => {
+                serial.write_fmt(format_args!("{adc_channel:?} = {adc_value:?}\n")).unwrap();
+            },
+            Err(err) => {
+                serial.write_fmt(format_args!("{adc_channel:?} = {err:?}\n")).unwrap();
+            }
+        }
+    }
 }
+
